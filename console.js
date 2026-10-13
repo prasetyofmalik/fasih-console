@@ -289,11 +289,13 @@ const FASIH = (() => {
     : typeof v === 'object' ? JSON.stringify(v) : String(v);
 
   /* ---------------- inti: submit ---------------- */
-  async function submitEdit(id, mutate, { dryRun = true, columns = null, comment = null, log = true } = {}) {
+  async function submitEdit(id, mutate, { dryRun = true, columns = null, comment = null, log = true } = {}, pre = null) {
     // Skema WAJIB ada sebelum menulis: tanpa itu coerce() tidak bisa memvalidasi
     // opsi dan akan meneruskan nilai mentah. Muat otomatis, jangan andalkan ingatan.
     if (!SCHEMA) await init({ assignmentId: id });
-    const asg = await getAssignment(id);
+    // `pre` = assignment yang sudah diambil pemanggil (jalur komentar). Menghemat
+    // satu GET per record; kalau null, diambil sendiri seperti biasa.
+    const asg = pre || await getAssignment(id);
     const sp  = asg.survey_period_id;
     const doc = JSON.parse(asg.data);
     const snapshot = new Map(doc.answers.map((a) => [a.dataKey, JSON.stringify(a.answer)]));
@@ -423,13 +425,33 @@ const FASIH = (() => {
     return rows;
   }
 
+  /* ---------------- loop batch ----------------
+     Satu tempat untuk "kerjakan N record berurutan dengan jeda, tolerate error,
+     kumpulkan hasil". Dipakai updateBatch, restore, dan setCommentBatch supaya
+     ketiganya punya perilaku jeda/penanganan error yang sama persis.
+     worker(item, i) wajib mengembalikan objek hasil; kalau melempar, runBatch
+     yang mengubahnya jadi baris { ok:false, error }. */
+  async function runBatch(items, worker, { delayMs = 1500, stopOnError = false } = {}) {
+    const out = [];
+    for (let i = 0; i < items.length; i++) {
+      try {
+        out.push(await worker(items[i], i));
+      } catch (e) {
+        out.push({ assignmentId: items[i] && items[i].assignmentId, ok: false, error: String(e) });
+        console.warn(`${i + 1}/${items.length} FAIL ${items[i] && items[i].assignmentId}  ${e}`);
+        if (stopOnError) break;
+      }
+      if (i < items.length - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+    return out;
+  }
+
   /** Cadangkan dokumen asli ke file .json (WAJIB sebelum batch). */
   async function backup(ids, filename = `fasih-backup-${Date.now()}.json`) {
     const arr = Array.isArray(ids) ? ids : [ids];
     const items = [];
     for (const id of arr) { const a = await getAssignment(id);
-      items.push({ assignmentId: id, code: a.code_identity, survey_period_id: a.survey_period_id,
-                   submit_version_code: a.submit_version_code, data: a.data, comment: a.comment,
+      items.push({ assignmentId: id, code: a.code_identity, pre_defined_data: a.pre_defined_data, data: a.data, comment: a.comment,
                    columns: Object.fromEntries([...Array(10)].map((_, i) => ['data' + (i + 1), a['data' + (i + 1)]])) }); }
     const blob = new Blob([JSON.stringify({ createdAt: new Date().toISOString(), items }, null, 1)],
                           { type: 'application/json' });
@@ -442,21 +464,16 @@ const FASIH = (() => {
   /** Kembalikan record ke isi backup. restore(backupItems, {dryRun:false}) */
   async function restore(backup, { dryRun = true, delayMs = 1200 } = {}) {
     const items = Array.isArray(backup) ? backup : backup.items;
-    const out = [];
-    for (const it of items) {
-      try {
-        const r = await submitEdit(it.assignmentId,
-          (doc) => { const orig = JSON.parse(it.data);
-                     doc.answers.length = 0; doc.answers.push(...orig.answers);
-                     Object.assign(doc, { description: orig.description, isForceSubmit: orig.isForceSubmit,
-                                          updatedAt: orig.updatedAt }); },
-          { dryRun, columns: it.columns, comment: it.comment, log: false });
-        out.push(r); console.log(`restore ok   ${it.assignmentId}`);
-      } catch (e) { out.push({ assignmentId: it.assignmentId, ok: false, error: String(e) });
-                    console.warn(`restore FAIL ${it.assignmentId} ${e}`); }
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-    return out;
+    return runBatch(items, async (it) => {
+      const r = await submitEdit(it.assignmentId,
+        (doc) => { const orig = JSON.parse(it.data);
+                   doc.answers.length = 0; doc.answers.push(...orig.answers);
+                   Object.assign(doc, { description: orig.description, isForceSubmit: orig.isForceSubmit,
+                                        updatedAt: orig.updatedAt }); },
+        { dryRun, columns: it.columns, comment: it.comment, log: false });
+      console.log(`restore ok   ${it.assignmentId}`);
+      return r;
+    }, { delayMs });
   }
 
   /**
@@ -466,36 +483,308 @@ const FASIH = (() => {
    */
   async function updateBatch(rows, { dryRun = true, delayMs = 1500, stopOnError = false, values = null } = {}) {
     const list = rows.map((r) => (typeof r === 'string' ? { assignmentId: r, values } : r));
-    const out = [];
-    for (let i = 0; i < list.length; i++) {
-      const r = list[i];
-      try {
-        const res = await update(r.assignmentId, r.values || {}, { dryRun, columns: r.columns || null, log: false });
-        out.push(res);
-        console.log(`${i + 1}/${list.length} ok   ${r.assignmentId}  ${res.nChanges} perubahan`);
-      } catch (e) {
-        out.push({ assignmentId: r.assignmentId, ok: false, error: String(e) });
-        console.warn(`${i + 1}/${list.length} FAIL ${r.assignmentId}  ${e}`);
-        if (stopOnError) break;
-      }
-      if (i < list.length - 1) await new Promise((x) => setTimeout(x, delayMs));
-    }
-    //console.table(out.map(({ assignmentId, code, ok, nChanges, versionAfter, error }) =>
-    //  ({ assignmentId, code, ok: ok !== false, nChanges, versionAfter, error })));
-    return out;
+    return runBatch(list, async (r, i) => {
+      const res = await update(r.assignmentId, r.values || {}, { dryRun, columns: r.columns || null, log: false });
+      console.log(`${i + 1}/${list.length} ok   ${r.assignmentId}  ${res.nChanges} perubahan`);
+      return res;
+    }, { delayMs, stopOnError });
   }
 
-  /** Tambah/ubah catatan per-pertanyaan (comment.json). */
-  async function setComment(id, dataKey, text, { dryRun = true, author = null } = {}) {
-    const asg = await getAssignment(id);
-    const c = JSON.parse(asg.comment || '{"dataKey":"","notes":[]}');
+  /* ---------------- komentar per-pertanyaan (comment.json) ----------------
+     comment.json BERBEDA dari data.json: dokumen assignment tidak disentuh sama
+     sekali (mutate = null), hanya file kedua di dalam ZIP yang berubah. Karena
+     itu perubahannya TIDAK PERNAH muncul di tabel `changes` — nChanges selalu 0
+     dan yang perlu dicek justru versionAfter/statusAfter.
+
+     Bentuknya dua lapis:
+       { dataKey:"", notes:[ { dataKey, comments:[ {comment, datetime, sender} ] } ] }
+
+     PENTING soal `sender`: FormGear menyimpan nama penulis komentar di field
+     `sender` (BUKAN `username`), dan selalu berupa string. Kalau `sender` tidak
+     ada, modal komentar FASIH memanggil `.toLowerCase()` di atasnya dan seluruh
+     bagian gagal dirender dengan
+       "Cannot read properties of undefined (reading 'toLowerCase')".
+     Karena itu `sender` selalu diisi dan TIDAK PERNAH kosong. Urutannya:
+     `author` -> nama akun login (resolveUsername: storage/cookie/DOM) ->
+     `sender` yang sudah ada -> `current_user_username` record. `username` ikut
+     diisi agar tetap kompatibel dengan pembaca versi lama, dan `datetime`
+     memakai format FormGear "YYYY-MM-DD HH:mm:ss".
+     Kalau nama akun tidak terdeteksi otomatis, set manual:
+       FASIH.setUser('username.sso')   dan cek   FASIH.whoami()
+
+     Secara default komentar bersifat TAMBAHAN (push), bukan timpa — di web ia
+     tampil berderet seperti bubble chat, satu bubble per elemen `comments`.
+     Kalau batch dijalankan ulang atau ada retry jaringan, teks yang sama akan
+     muncul berkali-kali di audit trail. Karena itu `dedupe` (default true)
+     melompati komentar yang teksnya sudah ada untuk dataKey itu — dan saat
+     melompat, submit TIDAK dijalankan sama sekali sehingga versi dokumen juga
+     tidak naik. Pakai dedupe:false untuk perilaku append-mentah seperti versi
+     sebelumnya.
+
+     Untuk MENIMPA riwayat (menyisakan satu bubble) pakai `mode:'replace'`:
+     seluruh `comments` untuk dataKey itu dibuang lalu diisi satu komentar baru.
+     Cocok kalau komentar lama sudah tidak relevan / ingin dibersihkan.
+
+     Catatan perbaikan: comment.json yang ditulis script versi lama tidak punya
+     `sender` — atau `sender`-nya string kosong — sehingga web menampilkan "?".
+     Saat dijalankan ulang, komentar lama itu diperbaiki otomatis (sender diisi
+     nama akun login) dan tetap di-submit walau teksnya sudah ada, supaya record
+     yang sudah terlanjur tersentuh ikut sembuh.                              */
+
+  const p2 = (n) => String(n).padStart(2, '0');
+  const nowStamp = () => { const d = new Date();
+    return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
+           `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; };
+
+  /* ---------------- identitas penulis komentar ----------------
+     FASIH-SM login lewat SSO BPS (sso.bps.go.id); nama akun yang login tidak
+     disimpan di satu key yang pasti, jadi dicari berlapis: localStorage /
+     sessionStorage (JWT atau JSON) -> cookie -> DOM -> fallback
+     `current_user_username` dari record assignment. Karena `sender` tidak boleh
+     kosong/null (kalau kosong web menampilkan "?" dan pada versi lama malah
+     memicu error `.toLowerCase`), hasilnya bisa ditimpa manual lewat
+     FASIH.setUser('username.sso'); cek dengan FASIH.whoami().                */
+  let USERNAME = null;
+  let USERNAME_RESOLVED = false;
+
+  const STRONG_NAME_KEYS = ['preferred_username', 'preferredUsername', 'username', 'user_name', 'userName',
+                            'user_email', 'email', 'nip_baru', 'nip', 'usersso', 'user'];
+  const WEAK_NAME_KEYS = ['full_name', 'fullName', 'display_name', 'displayName', 'nama', 'name'];
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  function jwtPayload(token) {
+    try {
+      const part = String(token).split('.')[1];
+      if (!part) return null;
+      const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+      const bin = atob(b64 + '==='.slice((b64.length + 3) % 4));
+      const utf8 = decodeURIComponent(Array.from(bin).map(
+        (c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+      return JSON.parse(utf8);
+    } catch { return null; }
+  }
+
+  function pickUser(obj, keys, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 5) return null;
+    for (const k of keys) {
+      const v = obj[k];
+      if (v != null && (typeof v === 'string' || typeof v === 'number')) {
+        const s = String(v).trim();
+        if (s && s.length <= 120 && !UUID_RE.test(s)) return s;
+      }
+    }
+    for (const v of Object.values(obj))
+      if (v && typeof v === 'object') { const r = pickUser(v, keys, depth + 1); if (r) return r; }
+    return null;
+  }
+
+  function scanValue(val, keys) {
+    if (typeof val !== 'string') return null;
+    const s = val.trim();
+    if (!s) return null;
+    if (s.split('.').length === 3) {
+      const u = pickUser(jwtPayload(s), keys);
+      if (u) return u;
+    }
+    if (s.startsWith('{') || s.startsWith('[')) {
+      try { return pickUser(JSON.parse(s), keys); } catch {}
+    }
+    return null;
+  }
+
+  function scanStore(store, keys) {
+    try {
+      for (let i = 0; i < store.length; i++) {
+        const u = scanValue(store.getItem(store.key(i)), keys);
+        if (u) return u;
+      }
+    } catch {}
+    return null;
+  }
+
+  function resolveUsername() {
+    if (USERNAME) return USERNAME;
+    if (USERNAME_RESOLVED) return null;
+    USERNAME_RESOLVED = true;
+    for (const keys of [STRONG_NAME_KEYS, WEAK_NAME_KEYS]) {
+      let u = null;
+      try { u = scanStore(localStorage, keys); } catch {}
+      if (!u) { try { u = scanStore(sessionStorage, keys); } catch {} }
+      if (u) { USERNAME = u; return u; }
+    }
+    try {
+      for (const keys of [STRONG_NAME_KEYS, WEAK_NAME_KEYS]) {
+        for (const c of document.cookie.split(';')) {
+          const u = scanValue(decodeURIComponent(c.split('=').slice(1).join('=')), keys);
+          if (u) { USERNAME = u; return u; }
+        }
+      }
+    } catch {}
+    try {
+      const el = document.querySelector('[data-username],[data-user],.username,.user-name,.profile-name,[class*="profile"] [class*="name"]');
+      if (el) {
+        const t = (el.getAttribute('data-username') || el.textContent || '').trim();
+        if (t && t.length <= 60) { USERNAME = t; return t; }
+      }
+    } catch {}
+    return null;
+  }
+
+  /** Lihat/atur nama penulis komentar. FASIH.setUser('username.sso'), reset: FASIH.setUser(null). */
+  function setUser(name) {
+    USERNAME = name == null ? null : (String(name).trim() || null);
+    USERNAME_RESOLVED = true;
+    return USERNAME;
+  }
+  function whoami() { return USERNAME || resolveUsername() || '(belum terdeteksi)'; }
+
+  /** Nama penulis komentar. author -> akun login -> sender lama -> current_user_username. */
+  function senderName(asg, author) {
+    if (author != null && String(author).trim() !== '') return String(author).trim();
+    const u = resolveUsername();
+    if (u) return u;
+    try {
+      const c = JSON.parse(asg.comment || '{}');
+      for (const n of (c.notes || []))
+        for (const x of (n.comments || []))
+          if (x && (x.sender || x.username)) return String(x.sender || x.username);
+    } catch {}
+    if (asg && asg.current_user_username) return String(asg.current_user_username);
+    return '';
+  }
+
+  /* Isi `sender` (dan `username` bila belum ada / masih kosong) pada komentar
+     lama yang belum punya — termasuk yang `sender`-nya string kosong, karena
+     keduanya sama-sama memunculkan "?". Mengembalikan true kalau ada yang diubah
+     (sehingga submit ulang dijalankan untuk menyembuhkan record lama). */
+  function normalizeComments(c, fallbackSender) {
+    let changed = false;
+    for (const n of (c.notes || [])) {
+      for (const x of (n.comments || [])) {
+        if (!x || typeof x !== 'object') continue;
+        const senderNow = x.sender == null ? '' : String(x.sender).trim();
+        if (senderNow === '') {
+          const dariUsername = x.username != null && String(x.username).trim() !== '';
+          const s = dariUsername ? String(x.username).trim() : fallbackSender;
+          if (s !== '') {
+            x.sender = s;
+            x.username = s;
+            changed = true;
+          } else if (x.sender == null) {
+            x.sender = '';
+            if (x.username == null) x.username = '';
+            changed = true;
+          }
+        }
+        if (x.datetime == null) { x.datetime = nowStamp(); changed = true; }
+        if (x.comment == null)  { x.comment = ''; changed = true; }
+      }
+    }
+    return changed;
+  }
+
+  /** Bentuk comment.json baru dari comment.json lama. Murni lokal, tanpa jaringan.
+     mode:'append' (default) menambah bubble; mode:'replace' menimpa seluruh
+     riwayat komentar dataKey ini dengan satu komentar baru. */
+  function prepareComment(asg, dataKey, text, { author = null, dedupe = true, mode = 'append' } = {}) {
+    const c = JSON.parse(asg.comment && asg.comment.trim() ? asg.comment : '{"dataKey":"","notes":[]}');
     c.notes = c.notes || [];
+    const pengirim = senderName(asg, author);
+    let berubah = normalizeComments(c, pengirim);
+
     let note = c.notes.find((n) => n.dataKey === dataKey);
-    if (!note) { note = { dataKey, comments: [] }; c.notes.push(note); }
+    if (!note) { note = { dataKey, comments: [] }; c.notes.push(note); berubah = true; }
     note.comments = note.comments || [];
-    note.comments.push({ comment: text, datetime: new Date().toISOString(),
-                         ...(author ? { username: author } : {}) });
-    return submitEdit(id, null, { dryRun, comment: JSON.stringify(c) });
+
+    const sebelum = note.comments.length;
+    const komentarBaru = { sender: pengirim, username: pengirim, datetime: nowStamp(), comment: text };
+    let nDitambah = 0, nDihapus = 0;
+
+    if (mode === 'replace') {
+      // Sudah berupa satu komentar yang isinya sama -> tidak perlu submit ulang.
+      const sama = sebelum === 1 && note.comments[0] && note.comments[0].comment === text;
+      if (!sama) {
+        nDihapus = sebelum;
+        note.comments.length = 0;
+        note.comments.push(komentarBaru);
+        nDitambah = 1; berubah = true;
+      }
+    } else {
+      const sudah = dedupe && note.comments.some((x) => x && x.comment === text);
+      if (!sudah) { note.comments.push(komentarBaru); nDitambah = 1; berubah = true; }
+    }
+    return { commentJson: JSON.stringify(c), nDitambah, nDihapus, berubah,
+             jumlahKomentar: note.comments.length };
+  }
+
+  /** Tambah catatan per-pertanyaan ke comment.json.
+     FASIH.setComment(ID, dataKey, teks, { mode:'replace', dryRun:false }) menimpa. */
+  async function setComment(id, dataKey, text,
+                            { dryRun = true, author = null, dedupe = true, mode = 'append', log = true } = {}) {
+    const asg = await getAssignment(id);
+    const p = prepareComment(asg, dataKey, text, { author, dedupe, mode });
+    // `berubah` juga true saat komentar lama tanpa `sender` dirapikan, walau
+    // teks yang diminta sudah ada — supaya perbaikan ikut tersimpan.
+    if (!p.nDitambah && !p.berubah) {
+      if (log) console.log(`${id}: komentar untuk ${dataKey} sudah ada — dilewati (dedupe).`);
+      return { assignmentId: id, code: asg.code_identity, dataKey, ok: true, skipped: true,
+               nDitambah: 0, nDihapus: 0, jumlahKomentar: p.jumlahKomentar,
+               version: asg.submit_version_code, nChanges: 0, changes: [], dryRun };
+    }
+    // `asg` diteruskan ke submitEdit supaya assignment tidak diambil dua kali.
+    const r = await submitEdit(id, null, { dryRun, comment: p.commentJson, log }, asg);
+    return { ...r, dataKey, nDitambah: p.nDitambah, nDihapus: p.nDihapus,
+             jumlahKomentar: p.jumlahKomentar };
+  }
+
+  /**
+   * Tambah komentar ke banyak record sekaligus. SATU BARIS SATU RECORD —
+   * kalau assignmentId yang sama muncul beberapa kali, itu jadi beberapa submit
+   * berturut-turut dan record itu naik versinya beberapa kali.
+   *
+   *   rows: [{ assignmentId, dataKey, text, author?, mode? }]
+   *   opts: { dryRun, delayMs, stopOnError, dedupe, author, mode }
+   *
+   * `mode` (per baris atau global): 'append' (default, bubble bertambah) atau
+   * 'replace' (timpa riwayat dataKey itu jadi satu bubble).
+   *
+   * Semua dataKey divalidasi ke skema template SEBELUM request pertama, jadi
+   * salah ketik ketahuan sebelum ada record yang tersentuh — bukan sesudah.
+   * Memerlukan `await FASIH.init()` lebih dulu (dimuat otomatis bila belum).
+   */
+  async function setCommentBatch(rows, { dryRun = true, delayMs = 1500, stopOnError = false,
+                                         dedupe = true, author = null, mode = 'append' } = {}) {
+    if (!Array.isArray(rows)) throw new Error('setCommentBatch: rows harus array');
+    if (!rows.length) return [];
+
+    // Bentuk baris dicek dulu; nomor baris yang salah ikut dilaporkan.
+    const cacat = rows.map((r, i) => ({ r, i })).filter(({ r }) =>
+      !r || !r.assignmentId || !r.dataKey || typeof r.text !== 'string' || !r.text.trim()
+    ).map(({ i }) => i + 1);
+    if (cacat.length) throw new Error(
+      `setCommentBatch: baris ${cacat.join(', ')} tidak lengkap. ` +
+      `Setiap baris butuh { assignmentId, dataKey, text } dengan text teks non-kosong. ` +
+      `TIDAK ADA record yang tersentuh.`);
+
+    if (!SCHEMA) await init({ assignmentId: rows[0].assignmentId });
+    const takDikenal = [...new Set(rows.map((r) => baseKey(r.dataKey)))]
+                        .filter((k) => !SCHEMA.has(k));
+    if (takDikenal.length) throw new Error(
+      `setCommentBatch: dataKey tidak ada di template ini: ${takDikenal.join(', ')}. ` +
+      `Periksa ejaannya dengan FASIH.find(). TIDAK ADA record yang tersentuh.`);
+
+    return runBatch(rows, async (r, i) => {
+      const s = await setComment(r.assignmentId, r.dataKey, r.text,
+                                 { dryRun, dedupe, mode: r.mode || mode, log: false,
+                                   author: r.author || author });
+      const status = s.skipped ? 'dilewati' : s.dryRun ? 'dry-run' : (s.ok ? 'ok' : 'gagal');
+      console.log(`${i + 1}/${rows.length} [${status.toUpperCase()}] ${r.assignmentId}  ` +
+                  `${r.dataKey}  "${r.text.slice(0, 40)}"  -> ${s.jumlahKomentar} komentar` +
+                  (s.nDihapus ? ` (timpa ${s.nDihapus})` : ''));
+      return { no: i + 1, assignmentId: r.assignmentId, code: s.code, dataKey: r.dataKey,
+               nDitambah: s.nDitambah || 0, nDihapus: s.nDihapus || 0, jumlahKomentar: s.jumlahKomentar,
+               version: s.version, versionAfter: s.versionAfter, ok: status, error: null };
+    }, { delayMs, stopOnError });
   }
 
   /**
@@ -598,8 +887,9 @@ const FASIH = (() => {
   }
 
   return { init, audit, schema, find, dump, rows, backup, restore, geotag, getGeotag, setGeotag,
-           update, patch, updateBatch, roundTrip, setComment,
-           getAssignment, raw, _internal: { submitEdit, makeZip, md5hex, coerce, get SCHEMA() { return SCHEMA; } } };
+           update, patch, updateBatch, roundTrip, setComment, setCommentBatch, setUser, whoami,
+           getAssignment, raw, _internal: { submitEdit, makeZip, md5hex, coerce, resolveUsername,
+             prepareComment, normalizeComments, senderName, get SCHEMA() { return SCHEMA; } } };
 })();
 
 console.log('FASIH editor siap.  Mulai:  await FASIH.init()  lalu  await FASIH.dump("<assignmentId>")');
